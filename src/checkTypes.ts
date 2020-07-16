@@ -3,6 +3,7 @@ import {effect, state} from './index';
 const count1 = state(1);
 const count2 = state(2);
 const count3 = state(3);
+const asyncCount = state(async () => 0);
 const increaseReducer = (value, {by = 1}) => value + by;
 const increaseCount1 = effect(() => [count1, increaseReducer]);
 const increaseCount2 = effect(() => [count2, increaseReducer]);
@@ -17,7 +18,18 @@ const epic1 = effect(async function* () {
   }
 }).run();
 
-console.log(epic1);
+const doubleAsyncCount1 = asyncCount.map((value) => value * 2);
+const doubleAsyncCount2 = asyncCount.map('hello');
+const doubleCount1 = count1.map((value) => value * 2);
+const doubleCount2 = count1.map('abc');
+
+console.log(
+  epic1,
+  doubleAsyncCount1,
+  doubleAsyncCount2,
+  doubleCount1,
+  doubleCount2,
+);
 
 const epic2 = effect([count1, 100]).run();
 increaseCount1();
@@ -40,3 +52,10 @@ expect(firstLoadable).toEqual({
 const secondLoadable = doSomething.loadable();
 
 console.log(secondLoadable);
+
+const shape = state({
+  count1,
+  count2,
+});
+
+console.log(shape);

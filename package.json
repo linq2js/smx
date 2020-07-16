@@ -1,7 +1,7 @@
 {
   "name": "smx",
-  "version": "0.0.0",
-  "description": "A state management that is inspired on recoil",
+  "version": "0.0.5",
+  "description": "A state management that is inspired on recoiljs",
   "main": "dist/index.js",
   "types": "src/index.d.ts",
   "scripts": {
@@ -27,10 +27,7 @@
   "dependencies": {
     "iscope": "^0.0.7"
   },
-  "peerDependencies": {
-    "react": "^16.13.1",
-    "react-dom": "^16.13.1"
-  },
+  "peerDependencies": {},
   "jest": {
     "transform": {
       "^.+\\.jsx?$": "babel-jest"
@@ -49,7 +46,6 @@
     "@babel/plugin-transform-modules-commonjs": "^7.7.5",
     "@babel/preset-env": "^7.7.7",
     "@babel/preset-react": "^7.7.4",
-    "@babel/runtime": "^7.7.7",
-    "react": "^16.13.1"
+    "@babel/runtime": "^7.7.7"
   }
 }

@@ -3,8 +3,8 @@ import iscope from 'iscope';
 const unset = {};
 const emptyMap = new Map();
 const noop = () => {};
-const noSubscribe = () => noop;
-const defaultLoadable = createLiteralLoadable(undefined);
+const middlewareSeed = (value) => (next) => next(value);
+const identity = (value) => value;
 const evaluationScope = iscope(() => undefined);
 const uniquePropSuffix = new Date().getTime().toString();
 const setValueMethodName = '__update' + uniquePropSuffix;
@@ -18,17 +18,38 @@ const isUnknown = {};
 const hookTypes = {
   memo: 1,
 };
+const stateMiddleware = [];
+const effectMiddleware = [];
 
 emptyMap.value = unset;
 
-export function state(defaultValue) {
-  const initializer =
-    typeof defaultValue === 'function' ? defaultValue : () => defaultValue;
+export function state(defaultValue, updateFunction, options = {}) {
+  // state()
+  if (arguments.length < 3) {
+    if (typeof updateFunction !== 'function') {
+      options = updateFunction || options;
+      updateFunction = undefined;
+    }
+  }
+
+  const initializer = createStateInitializer(defaultValue);
+
+  if (!updateFunction && initializer.updateFunction) {
+    updateFunction = initializer.updateFunction;
+    delete initializer.updateFunction;
+  }
+
+  if (typeof updateFunction === 'function') {
+    return createCompoundState(initializer, updateFunction, options);
+  }
+
   const familyStates = createArrayKeyedMap();
   const defaultState = getFamilyState([]);
   function getFamilyState(args) {
     return familyStates.getOrAdd(args, () => {
-      const state = createFamilyState(initializer, args);
+      // apply middleware for state
+      const state = createStateFamily(initializer, args, options);
+
       if (args.length) {
         state.remove = () => {
           state.dispose();
@@ -55,7 +76,7 @@ export function state(defaultValue) {
 
 Object.assign(state, {
   memo(callback, deps = []) {
-    return useStateHook(hookTypes.memo, (hook, data) => {
+    return stateHook(hookTypes.memo, (hook, data) => {
       if (!data.__memo) {
         data.__memo = createArrayKeyedMap();
       }
@@ -65,9 +86,12 @@ Object.assign(state, {
       });
     });
   },
+  use(...middleware) {
+    return addMiddleware(stateMiddleware, middleware);
+  },
 });
 
-function useStateHook(type, callback) {
+function stateHook(type, callback) {
   const scope = evaluationScope();
   if (!scope) {
     throw new Error(
@@ -92,6 +116,7 @@ export function effect(generator = noop, options = {}) {
     generator = () => generatorResult;
   }
   let lastCall;
+  let loadableData;
   let latest;
   const epic = createEpic(generator, options);
   const onDispatch = createObservable();
@@ -135,6 +160,10 @@ export function effect(generator = noop, options = {}) {
     }
   }
 
+  function getCurrentValue() {
+    return lastCall ? lastCall.result : unset;
+  }
+
   Object.assign(impl, {
     [typePropName]: effectType,
     cancel() {
@@ -147,19 +176,8 @@ export function effect(generator = noop, options = {}) {
       return lastCall ? lastCall.result : void 0;
     },
     loadable() {
-      if (!lastCall) {
-        return defaultLoadable;
-      }
-
-      if (isPromiseLike(lastCall.result)) {
-        return createAsyncLoadable(lastCall.result);
-      }
-
-      if (!lastCall.loadable) {
-        lastCall.loadable = createLiteralLoadable(lastCall.result);
-      }
-
-      return lastCall.loadable;
+      loadableData = tryCreateLoadableData(loadableData, getCurrentValue);
+      return loadableData.loadable;
     },
     on: onDispatch.subscribe,
     run(payload) {
@@ -195,13 +213,84 @@ export function effect(generator = noop, options = {}) {
     },
   });
 
-  return impl;
+  return applyMiddleware(impl, effectMiddleware);
 }
 
-function createFamilyState(initializer, args) {
+Object.assign(effect, {
+  use(...middleware) {
+    return addMiddleware(effectMiddleware, middleware);
+  },
+});
+
+function addMiddleware(allMiddleware, middleware) {
+  allMiddleware.push(...middleware);
+  return () => {
+    while (middleware.length) {
+      const m = middleware.pop();
+      const index = allMiddleware.indexOf(m);
+      if (index !== -1) {
+        allMiddleware.splice(index, 1);
+      }
+    }
+  };
+}
+
+function createCompoundState(initializer, updateFunction) {
+  let changeToken;
+  const shadowEffect = effect(({prevValue, value, args}) => {
+    return updateFunction(...args)(value, prevValue);
+  });
+
+  function onChange({args, value, prevValue}) {
+    const token = (changeToken = {});
+    if (isPromiseLike(value) || isPromiseLike(prevValue)) {
+      Promise.all([value, prevValue]).then(([value, prevValue]) => {
+        // something changed since last change
+        if (token !== changeToken) {
+          return;
+        }
+        shadowEffect({args, value, prevValue});
+      });
+    } else {
+      shadowEffect({args, value, prevValue});
+    }
+  }
+
+  return state(initializer, {
+    onChange,
+  });
+}
+
+function createStateInitializer(defaultValue) {
+  if (typeof defaultValue === 'object') {
+    const entries = Object.entries(defaultValue);
+    // all prop values must be state
+    if (entries.every((entry) => is(entry[1]).state)) {
+      return Object.assign(
+        function () {
+          let result = {};
+          entries.forEach(([key, state]) => {
+            result[key] = state.value();
+          });
+
+          return result;
+        },
+        {
+          updateFunction() {
+            return (value) =>
+              entries.map(([key, state]) => [state, value[key]]);
+          },
+        },
+      );
+    }
+  }
+  return typeof defaultValue === 'function' ? defaultValue : () => defaultValue;
+}
+
+function createStateFamily(initializer, args, options) {
   let currentValue = unset;
   let valueHasBeenChanged = false;
-  let loadable;
+  let loadableData;
   let isDisposed = false;
   const onChange = createObservable();
   const hookData = [];
@@ -224,8 +313,17 @@ function createFamilyState(initializer, args) {
     currentValue = unset;
     getValue();
     if (currentValue !== prevValue) {
-      onChange.dispatch();
+      dispatchOnChange(prevValue);
     }
+  }
+
+  function dispatchOnChange(prevValue) {
+    onChange.dispatch({
+      state: impl,
+      args,
+      value: currentValue,
+      prevValue,
+    });
   }
 
   function checkDisposed() {
@@ -251,7 +349,6 @@ function createFamilyState(initializer, args) {
     }
 
     if (currentValue === unset) {
-      loadable = undefined;
       try {
         currentValue = evaluationScope(
           {hookIndex: 0, hookData, addDependency},
@@ -269,6 +366,10 @@ function createFamilyState(initializer, args) {
     return currentValue;
   }
 
+  function getCurrentValue() {
+    return currentValue;
+  }
+
   function setValue(nextValue) {
     checkDisposed();
 
@@ -283,16 +384,21 @@ function createFamilyState(initializer, args) {
     }
 
     if (currentValue !== nextValue) {
+      const prevValue = currentValue;
       valueHasBeenChanged = true;
       dependencyStates.clear();
       currentValue = nextValue;
-      onChange.dispatch();
+      dispatchOnChange(prevValue);
     }
     return nextValue;
   }
 
-  function map(mapper) {
+  function map(mapper, unsafe) {
     checkDisposed();
+
+    if (typeof mapper !== 'function') {
+      mapper = createPropMapper(mapper, unsafe);
+    }
 
     return state(() => {
       const value = getValue();
@@ -309,14 +415,15 @@ function createFamilyState(initializer, args) {
     }
     isDisposed = true;
     onChange.clear();
-    if (isPromiseLike(currentValue) && currentValue.__disposeLoadable) {
-      currentValue.__disposeLoadable();
+    if (loadableData) {
+      loadableData.dispose();
     }
   }
 
   const impl = {
     [typePropName]: stateType,
     [setValueMethodName]: setValue,
+    rootState: true,
     value: getValue,
     on(listener) {
       checkDisposed();
@@ -327,18 +434,67 @@ function createFamilyState(initializer, args) {
     dispose,
     loadable() {
       getValue();
-
-      if (isPromiseLike(currentValue)) {
-        return createAsyncLoadable(currentValue);
-      }
-      if (!loadable) {
-        loadable = createLiteralLoadable(currentValue);
-      }
-      return loadable;
+      loadableData = tryCreateLoadableData(loadableData, getCurrentValue);
+      return loadableData.loadable;
     },
   };
 
-  return impl;
+  options.onChange && onChange.subscribe(options.onChange);
+
+  return applyMiddleware(impl, stateMiddleware);
+}
+
+function tryCreateLoadableData(loadableData, getter) {
+  if (!loadableData || loadableData.value !== getter()) {
+    if (loadableData) {
+      loadableData.dispose();
+    }
+    const {subscribe: on, dispatch, clear} = createObservable();
+    loadableData = {
+      ...loadableData,
+      value: getter(),
+      dispose() {
+        clear();
+      },
+    };
+
+    if (isPromiseLike(loadableData.value)) {
+      loadableData.loadable = {
+        on,
+        state: 'loading',
+      };
+      loadableData.value
+        .then(
+          (value) =>
+            (loadableData.loadable = {
+              on,
+              state: 'hasValue',
+              value,
+            }),
+          (error) =>
+            (loadableData.loadable = {
+              on,
+              state: 'hasError',
+              error,
+            }),
+        )
+        .finally(() => {
+          // something changed since last time
+          if (loadableData.value !== getter()) {
+            return;
+          }
+          dispatch();
+        });
+    } else {
+      loadableData.loadable = {
+        on,
+        state: 'hasValue',
+        value: loadableData.value,
+      };
+    }
+  }
+
+  return loadableData;
 }
 
 export function is(obj) {
@@ -353,6 +509,13 @@ export function is(obj) {
     return isFunction;
   }
   return isUnknown;
+}
+
+function applyMiddleware(obj, middleware) {
+  return middleware.reduce(
+    (middleware, next) => (effect) => middleware(effect)(next),
+    middlewareSeed,
+  )(obj)(identity);
 }
 
 function createEpic(generator, options) {
@@ -460,7 +623,7 @@ function createEpic(generator, options) {
       let state = target;
       // mutate state using reducer
       if (typeof payload === 'function') {
-        const isRootState = typeof state === 'function';
+        const isRootState = state.rootState;
         const reducer = payload;
         const resolver = args[1] || options.stateResolver;
         // resolve state if
@@ -564,60 +727,6 @@ function createEpic(generator, options) {
   };
 }
 
-function createAsyncLoadable(promise) {
-  if (promise.__loadable) {
-    return promise.__loadable;
-  }
-  const {subscribe, dispatch, clear} = createObservable();
-  const loadable = (promise.__loadable = {
-    state: 'loading',
-    subscribe,
-  });
-
-  promise.__disposeLoadable = clear;
-
-  promise
-    .then(
-      (payload) => {
-        promise.__loadable = createLiteralLoadable(payload);
-      },
-      (error) => {
-        promise.__loadable = createLiteralLoadable(undefined, error);
-      },
-    )
-    .finally(() => {
-      try {
-        dispatch();
-      } finally {
-        clear();
-        delete promise.__disposeLoadable;
-      }
-    });
-  return loadable;
-}
-
-function createLiteralLoadable(value, error) {
-  if (value instanceof Error) {
-    return {
-      state: 'hasError',
-      error: value,
-      subscribe: noSubscribe,
-    };
-  }
-  if (error) {
-    return {
-      state: 'hasError',
-      error,
-      subscribe: noSubscribe,
-    };
-  }
-  return {
-    state: 'hasValue',
-    value,
-    subscribe: noSubscribe,
-  };
-}
-
 /**
  * check an obj is promise like or not
  * @param obj
@@ -712,6 +821,15 @@ function createArrayKeyedMap() {
       }
     },
   };
+}
+
+function createPropMapper(prop, unsafe) {
+  return (value) =>
+    unsafe
+      ? typeof value === 'undefined' || value === null
+        ? void 0
+        : value[prop]
+      : value[prop];
 }
 
 class ErrorValue {

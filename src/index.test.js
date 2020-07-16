@@ -8,7 +8,7 @@ const stateResolver = (state, {stateId}) => state(stateId);
 
 test('simple state & effect', () => {
   const count = state(1);
-  const increase = effect(() => [count, increaseReducer]);
+  const increase = effect([count, increaseReducer]);
 
   expect(count.value()).toBe(1);
 
@@ -39,6 +39,18 @@ test('sync generator', () => {
   expect(count2.value()).toBe(3);
   expect(count3.value()).toBe(4);
   expect(callback).toBeCalledWith({data: true});
+});
+
+test('async generator', async () => {
+  const count = state(0);
+  const increase = effect(async () => {
+    await delay(5);
+    return [count, (value) => value + 1];
+  });
+
+  await increase();
+
+  expect(count.value()).toBe(1);
 });
 
 test('await effect or state', async () => {
@@ -279,7 +291,7 @@ test('state.loadable() async', async () => {
   expect(firstLoadable).toEqual({
     state: 'loading',
     value: undefined,
-    subscribe: expect.anything(),
+    on: expect.anything(),
   });
 
   await delay(15);
@@ -288,7 +300,7 @@ test('state.loadable() async', async () => {
   expect(secondLoadable).toEqual({
     state: 'hasValue',
     value: 1,
-    subscribe: expect.anything(),
+    on: expect.anything(),
   });
 });
 
@@ -299,7 +311,7 @@ test('state.loadable() sync', async () => {
   expect(firstLoadable).toEqual({
     state: 'hasValue',
     value: 1,
-    subscribe: expect.anything(),
+    on: expect.anything(),
   });
 
   await delay(15);
@@ -319,7 +331,7 @@ test('effect.loadable() async', async () => {
   expect(firstLoadable).toEqual({
     state: 'loading',
     value: undefined,
-    subscribe: expect.anything(),
+    on: expect.anything(),
   });
 
   await delay(15);
@@ -328,7 +340,7 @@ test('effect.loadable() async', async () => {
   expect(secondLoadable).toEqual({
     state: 'hasValue',
     value: undefined,
-    subscribe: expect.anything(),
+    on: expect.anything(),
   });
 });
 
@@ -342,7 +354,7 @@ test('effect.loadable() sync', async () => {
   expect(firstLoadable).toEqual({
     state: 'hasValue',
     value: undefined,
-    subscribe: expect.anything(),
+    on: expect.anything(),
   });
 
   await delay(15);
@@ -378,4 +390,106 @@ test('got error if call hook inside other hook', () => {
   expect(count.value).toThrow(
     'Don’t call Hooks inside loops, conditions, or nested hooks and outside state evaluation function',
   );
+});
+
+test('compound state', () => {
+  const formData = state({
+    field1: 1,
+    field2: 2,
+    field3: 3,
+  });
+
+  const fieldData = state(
+    (field) => {
+      return formData.value()[field];
+    },
+    (field) => (value) => [
+      formData,
+      (prevValue) => ({
+        ...prevValue,
+        [field]: value,
+      }),
+    ],
+  );
+
+  const updateField = effect(({field, value}) => [fieldData(field), value]);
+
+  expect(fieldData('field1').value()).toBe(1);
+  expect(fieldData('field2').value()).toBe(2);
+
+  updateField({field: 'field1', value: 2});
+  updateField({field: 'field2', value: 3});
+
+  expect(fieldData('field1').value()).toBe(2);
+  expect(fieldData('field2').value()).toBe(3);
+
+  expect(formData.value()).toEqual({
+    field1: 2,
+    field2: 3,
+    field3: 3,
+  });
+});
+
+test('state shape', () => {
+  const username = state('admin');
+  const password = state('123456');
+  const passwordChanged = jest.fn();
+  const usernameChanged = jest.fn();
+
+  const userProfile = state({
+    username,
+    password,
+  });
+  const updateUserProfile = effect(({username, password}) => [
+    userProfile,
+    {username, password},
+  ]);
+
+  const changePassword = effect([
+    password,
+    (value, payload) => payload.password,
+  ]);
+
+  username.on(usernameChanged);
+  password.on(passwordChanged);
+
+  expect(userProfile.value()).toEqual({
+    username: 'admin',
+    password: '123456',
+  });
+
+  changePassword({password: '123'});
+
+  // when password is changed, userProfile.password must be changed too
+  expect(userProfile.value()).toEqual({
+    username: 'admin',
+    password: '123',
+  });
+
+  updateUserProfile({
+    username: 'admin',
+    password: '654321',
+  });
+
+  expect(usernameChanged).toBeCalledTimes(0);
+  expect(passwordChanged).toBeCalledTimes(2);
+
+  expect(userProfile.value()).toEqual({
+    username: 'admin',
+    password: '654321',
+  });
+});
+
+test('state middleware', () => {
+  const callback = jest.fn();
+  const removeMiddleware = state.use((state) => (next) => {
+    callback(state.value());
+    return next(state);
+  });
+
+  state(1);
+
+  removeMiddleware();
+
+  expect(callback).toBeCalledWith(1);
 });

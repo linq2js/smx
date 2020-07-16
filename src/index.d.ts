@@ -3,8 +3,17 @@ export const effect: EffectExports;
 
 interface StateExports extends Function {
   (): StateRoot<any>;
-  <T>(value: T | ((...args: any[]) => T)): StateRoot<T>;
+  <T extends StateShape>(shape: T): StateShapeInfer<T>;
+  <T>(
+    value: T | ((...args: any[]) => T),
+    update?: UpdateFunction<T>,
+    options?: StateOptions<T>,
+  ): StateRoot<T>;
+  <T>(value: T | ((...args: any[]) => T), options: StateOptions<T>): StateRoot<
+    T
+  >;
   memo<T>(callback: () => T, deps?: any[]): T;
+  use(...middleware: StateMiddleware[]): UnregisterMiddleware;
 }
 
 interface EffectExports extends Function {
@@ -37,7 +46,35 @@ interface EffectExports extends Function {
     generator: (payload?: any) => TResult,
     options?: EffectOptions<any>,
   ): EffectInfer<any, TResult>;
+
+  use(...middleware: EffectMiddleware[]): UnregisterMiddleware;
 }
+
+type StateShapeInfer<T> = State<
+  {[key in keyof T]: StateShapePropValueInfer<T[key]>}
+>;
+
+type StateShapePropValueInfer<T> = T extends State<infer U> ? U : T;
+
+type StateShape = {
+  [key: string]: State<any>;
+};
+
+type StateOptions<T> = {};
+
+type UpdateFunction<T> = T extends Promise<infer U>
+  ? (...args: any[]) => (value: U, prevValue?: U) => Rule | void
+  : (...args: any[]) => (value: T, prevValue?: T) => Rule | void;
+
+type StateMiddleware = (
+  state: State<any>,
+) => (next: (state: State<any>) => State<any>) => State<any>;
+
+type EffectMiddleware = (
+  effect: Effect<any, any>,
+) => (next: (effect: Effect<any, any>) => Effect<any, any>) => Effect<any, any>;
+
+type UnregisterMiddleware = () => void;
 
 type AsyncEffectType = 'async';
 
@@ -106,7 +143,7 @@ interface State<T> {
    */
   on(listener: ChangeListener): RemoveListener;
 
-  map<U>(mapper: Mapper<T, U>): State<U>;
+  map: MapperInfer<T>;
 
   reset(): void;
 
@@ -118,6 +155,20 @@ interface Loadable<T> {
   error: any;
   value: T;
 }
+
+type MapperInfer<T> = T extends Promise<infer U>
+  ? AsyncMapper<U>
+  : SyncMapper<T>;
+
+interface AsyncMapper<T> extends PropMapper {
+  (mapper: (value: T) => T): State<Promise<T>>;
+}
+
+interface SyncMapper<T> extends PropMapper {
+  (mapper: (value: T) => T): State<T>;
+}
+
+type PropMapper = (prop: string | number, unsafe?: boolean) => State<any>;
 
 type Mapper<Source, Destination> = (source: Source) => Destination;
 
