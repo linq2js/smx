@@ -1,18 +1,29 @@
-import iscope from 'iscope';
+import createScope from 'iscope';
 
 const unset = {};
 const emptyMap = new Map();
 const noop = () => {};
 const middlewareSeed = (value) => (next) => next(value);
 const identity = (value) => value;
-const evaluationScope = iscope(() => undefined);
-const uniquePropSuffix = new Date().getTime().toString();
-const setValueMethodName = '__update' + uniquePropSuffix;
-const typePropName = '__smx' + uniquePropSuffix;
-const stateType = 1;
-const effectType = 2;
-const isState = {state: true};
-const isEffect = {effect: true};
+const createProp =
+  typeof Symbol === 'undefined'
+    ? (propName) => `__${propName}${Math.random()}`
+    : (propName) => Symbol(propName);
+const evaluationScope = createScope(() => undefined);
+const setValueMethodName = createProp('set');
+const typePropName = createProp('type');
+const shadowTypePropName = createProp('shadowType');
+const resolverPropName = createProp('resolver');
+const objectTypes = {
+  state: 1,
+  effect: 2,
+  allState: 3,
+  syncState: 4,
+  valueWatcher: 5,
+  loadableWatcher: 6,
+};
+const isState = {state: true, stateOrEffect: true};
+const isEffect = {effect: true, stateOrEffect: true};
 const isFunction = {function: true};
 const isUnknown = {};
 const hookTypes = {
@@ -20,6 +31,9 @@ const hookTypes = {
 };
 const stateMiddleware = [];
 const effectMiddleware = [];
+const defaultPromiseResolverForWatcher = (promise) => {
+  throw promise;
+};
 
 emptyMap.value = unset;
 
@@ -47,6 +61,10 @@ export function state(defaultValue, updateFunction, options = {}) {
   const defaultState = getFamilyState([]);
   function getFamilyState(args) {
     return familyStates.getOrAdd(args, () => {
+      if (impl[resolverPropName]) {
+        return impl[resolverPropName](args);
+      }
+
       // apply middleware for state
       const state = createStateFamily(initializer, args, options);
 
@@ -59,6 +77,7 @@ export function state(defaultValue, updateFunction, options = {}) {
         // do nothing when removing defaultState
         state.remove = noop;
       }
+
       return state;
     });
   }
@@ -71,7 +90,16 @@ export function state(defaultValue, updateFunction, options = {}) {
     return getFamilyState(args);
   }
 
-  return Object.assign(impl, defaultState);
+  return Object.assign(impl, {
+    ...defaultState,
+    mapAll(mapper, unsafe) {
+      // create empty state
+      const stateRoot = state();
+      stateRoot[resolverPropName] = (args) =>
+        getFamilyState(args).map(mapper, unsafe);
+      return stateRoot;
+    },
+  });
 }
 
 Object.assign(state, {
@@ -89,7 +117,124 @@ Object.assign(state, {
   use(...middleware) {
     return addMiddleware(stateMiddleware, middleware);
   },
+  loadableWatcher(targets, prevInstance) {
+    return createWatcher(
+      objectTypes.loadableWatcher,
+      prevInstance,
+      undefined,
+      targets,
+      (target) => target.loadable(),
+      (target, handleChange) => {
+        const removeStateListener = target.on(() => {
+          removeStateListener.removeLoadableListener();
+          removeStateListener.removeLoadableListener = target
+            .loadable()
+            .on(handleChange);
+
+          handleChange();
+        });
+        removeStateListener.removeLoadableListener = target
+          .loadable()
+          .on(handleChange);
+
+        return removeStateListener;
+      },
+    );
+  },
+  valueWatcher(
+    targets,
+    prevInstance,
+    promiseResolver = defaultPromiseResolverForWatcher,
+  ) {
+    return createWatcher(
+      objectTypes.valueWatcher,
+      prevInstance,
+      () => prevInstance.promiseResolver === promiseResolver,
+      targets,
+      (target) => {
+        const loadable = target.loadable();
+
+        // is promise
+        if (loadable.state === 'loading') {
+          return promiseResolver(target.value());
+        }
+
+        if (loadable.state === 'hasError') {
+          throw loadable.error;
+        }
+
+        return loadable.value;
+      },
+      (target, handleChange) => target.on(handleChange),
+      {
+        promiseResolver,
+      },
+    );
+  },
 });
+
+function createWatcher(
+  type,
+  prevInstance,
+  instanceVerifier,
+  targets,
+  valueMapper,
+  addListener,
+  props,
+) {
+  const isMultiple = Array.isArray(targets);
+  if (!isMultiple) {
+    targets = [targets];
+  }
+
+  if (
+    prevInstance &&
+    prevInstance[typePropName] === type &&
+    prevInstance.targets.length === targets.length &&
+    prevInstance.targets.every((target, index) => target === targets[index]) &&
+    (!instanceVerifier || instanceVerifier(prevInstance))
+  ) {
+    return prevInstance;
+  }
+
+  let isDisposed = false;
+  let unwatch;
+
+  return {
+    ...props,
+    [typePropName]: type,
+    targets,
+    dispose() {
+      if (isDisposed) {
+        return;
+      }
+      try {
+        unwatch && unwatch();
+      } finally {
+        isDisposed = true;
+      }
+    },
+    watch(onChange) {
+      if (isDisposed) {
+        return;
+      }
+      const handleChange = () => !isDisposed && onChange();
+      const removeListeners = targets.map((target) =>
+        addListener(target, handleChange),
+      );
+      unwatch = () => {
+        removeListeners.forEach((unsubscribe) => unsubscribe());
+        unwatch = undefined;
+      };
+
+      return unwatch;
+    },
+    get() {
+      const values = targets.map(valueMapper);
+      return isMultiple ? values : values[0];
+    },
+  };
+}
 
 function stateHook(type, callback) {
   const scope = evaluationScope();
@@ -121,7 +266,7 @@ export function effect(generator = noop, options = {}) {
   const epic = createEpic(generator, options);
   const onDispatch = createObservable();
 
-  function impl(payload = {}) {
+  function run(payload = {}) {
     let isAsyncResult = false;
 
     try {
@@ -160,12 +305,16 @@ export function effect(generator = noop, options = {}) {
     }
   }
 
+  function impl(payload) {
+    return impl.run(payload);
+  }
+
   function getCurrentValue() {
     return lastCall ? lastCall.result : unset;
   }
 
   Object.assign(impl, {
-    [typePropName]: effectType,
+    [typePropName]: objectTypes.effect,
     cancel() {
       lastCall &&
         lastCall.result &&
@@ -180,8 +329,21 @@ export function effect(generator = noop, options = {}) {
       return loadableData.loadable;
     },
     on: onDispatch.subscribe,
-    run(payload) {
-      return impl(payload);
+    run,
+    extend(props) {
+      let newImpl;
+      // payload mapper
+      if (typeof props === 'function') {
+        const payloadMapper = props;
+        props = undefined;
+        newImpl = (payload = {}) => newImpl.run(payloadMapper(payload));
+      } else {
+        newImpl = (payload = {}) => newImpl.run(payload);
+      }
+      return Object.assign(newImpl, {
+        ...impl,
+        ...props,
+      });
     },
     latest() {
       return (
@@ -292,6 +454,8 @@ function createStateFamily(initializer, args, options) {
   let valueHasBeenChanged = false;
   let loadableData;
   let isDisposed = false;
+  let syncState;
+  let allState;
   const onChange = createObservable();
   const hookData = [];
   const dependencyStates = new Set();
@@ -319,7 +483,7 @@ function createStateFamily(initializer, args, options) {
 
   function dispatchOnChange(prevValue) {
     onChange.dispatch({
-      state: impl,
+      // state: impl,
       args,
       value: currentValue,
       prevValue,
@@ -373,6 +537,10 @@ function createStateFamily(initializer, args, options) {
   function setValue(nextValue) {
     checkDisposed();
 
+    if (options.readonly) {
+      throw new Error('Cannot update readonly state');
+    }
+
     if (typeof nextValue === 'function') {
       // make sure currentValue is set
       getValue();
@@ -421,7 +589,7 @@ function createStateFamily(initializer, args, options) {
   }
 
   const impl = {
-    [typePropName]: stateType,
+    [typePropName]: objectTypes.state,
     [setValueMethodName]: setValue,
     rootState: true,
     value: getValue,
@@ -436,6 +604,85 @@ function createStateFamily(initializer, args, options) {
       getValue();
       loadableData = tryCreateLoadableData(loadableData, getCurrentValue);
       return loadableData.loadable;
+    },
+    extend(props) {
+      return {
+        ...impl,
+        ...props,
+      };
+    },
+    allSync() {
+      return impl.sync().all();
+    },
+    all() {
+      if (impl[shadowTypePropName] === objectTypes.allState) {
+        return impl;
+      }
+      if (!allState) {
+        let prev = [];
+        allState = createStateFamily(
+          () => {
+            const value = getValue();
+
+            if (
+              impl[shadowTypePropName] === objectTypes.syncState &&
+              !impl.__prev
+            ) {
+              return prev;
+            }
+            return (prev = prev.concat(value));
+          },
+          args,
+          {
+            readonly: true,
+          },
+        );
+        allState[shadowTypePropName] = objectTypes.allState;
+      }
+      return allState;
+    },
+    sync() {
+      if (impl[shadowTypePropName] === objectTypes.syncState) {
+        return impl;
+      }
+      if (!syncState) {
+        syncState = createStateFamily(
+          () => {
+            const value = getValue();
+            if (isPromiseLike(value)) {
+              if (value.__resolved) {
+                return value.__resolved.value;
+              }
+              const promise = (syncState.__syncPromise = value);
+              const resolveValue = (value) => {
+                // value can be error or anything
+                promise.__resolved = {value};
+                // dependency state has been changed
+                if (promise !== syncState.__syncPromise) {
+                  return;
+                }
+                syncState.__prev = {value};
+                syncState.reset();
+              };
+              // waiting promise resolved
+              promise.then(resolveValue, resolveValue);
+              // return prev value if possible
+              if (syncState.__prev) {
+                return syncState.__prev.value;
+              }
+              // unless return default value
+              return options.defaultValue;
+            }
+            return value;
+          },
+          args,
+          {
+            readonly: true,
+          },
+        );
+      }
+      syncState[shadowTypePropName] = objectTypes.syncState;
+      return syncState;
     },
   };
 
@@ -499,10 +746,10 @@ function tryCreateLoadableData(loadableData, getter) {
 
 export function is(obj) {
   if (obj) {
-    if (obj[typePropName] === stateType) {
+    if (obj[typePropName] === objectTypes.state) {
       return isState;
     }
-    if (obj[typePropName] === effectType) {
+    if (obj[typePropName] === objectTypes.effect) {
       return isEffect;
     }
   } else if (typeof obj === 'function') {

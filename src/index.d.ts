@@ -14,6 +14,29 @@ interface StateExports extends Function {
   >;
   memo<T>(callback: () => T, deps?: any[]): T;
   use(...middleware: StateMiddleware[]): UnregisterMiddleware;
+
+  valueWatcher<TState, TInstance extends Watcher<PromiseToTypeInfer<TState>>>(
+    state: State<TState>,
+    prevInstance?: TInstance,
+    promiseResolver?: (promise: Promise<any>) => void,
+  ): TInstance;
+  valueWatcher<TInstance extends Watcher<any[]>>(
+    states: State<any>[],
+    prevInstance?: TInstance,
+    promiseResolver?: (promise: Promise<any>) => void,
+  ): TInstance;
+
+  loadableWatcher<
+    TState,
+    TInstance extends Watcher<Loadable<PromiseToTypeInfer<TState>>>
+  >(
+    state: State<TState>,
+    prevInstance?: TInstance,
+  ): TInstance;
+  loadableWatcher<TInstance extends Watcher<Loadable<any>[]>>(
+    states: State<any>[],
+    prevInstance?: TInstance,
+  ): TInstance;
 }
 
 interface EffectExports extends Function {
@@ -60,7 +83,10 @@ type StateShape = {
   [key: string]: State<any>;
 };
 
-type StateOptions<T> = {};
+type StateOptions<T> = {
+  readonly?: boolean;
+  defaultValue?: T;
+};
 
 type UpdateFunction<T> = T extends Promise<infer U>
   ? (...args: any[]) => (value: U, prevValue?: U) => Rule | void
@@ -71,8 +97,10 @@ type StateMiddleware = (
 ) => (next: (state: State<any>) => State<any>) => State<any>;
 
 type EffectMiddleware = (
-  effect: Effect<any, any>,
-) => (next: (effect: Effect<any, any>) => Effect<any, any>) => Effect<any, any>;
+  effect: EffectApi<any, any>,
+) => (
+  next: (effect: EffectApi<any, any>) => EffectApi<any, any>,
+) => EffectApi<any, any>;
 
 type UnregisterMiddleware = () => void;
 
@@ -97,9 +125,13 @@ interface EffectExecutor<TPayload, TResult> extends Function {
   (payload?: TPayload): TResult;
 }
 
-interface Effect<TPayload, TResult> extends EffectExecutor<TPayload, TResult> {
+interface Effect<TPayload, TResult>
+  extends EffectExecutor<TPayload, TResult>,
+    EffectApi<TPayload, TResult> {}
+
+interface EffectApi<TPayload, TResult> {
   value(): TResult;
-  loadable(): LoadableInfer<TResult>;
+  loadable(): Loadable<PromiseToTypeInfer<TResult>>;
   cancel(rule: string): Effect<TPayload, TResult>;
   /**
    * listen effect dispatching
@@ -111,6 +143,8 @@ interface Effect<TPayload, TResult> extends EffectExecutor<TPayload, TResult> {
   latest(): EffectExecutor<TPayload, TResult>;
   throttle(ms: number): EffectExecutor<TPayload, TResult>;
   debounce(ms: number): EffectExecutor<TPayload, void>;
+  extend(payloadMapper: (payload?: any) => any): Effect<any, any>;
+  extend(props?: any): Effect<any, any>;
 }
 
 interface StateRoot<T> extends State<T>, Function {
@@ -119,6 +153,7 @@ interface StateRoot<T> extends State<T>, Function {
    * @param args
    */
   (...args: any[]): State<T>;
+  mapAll: MapAllInfer<T>;
 }
 
 interface State<T> {
@@ -135,7 +170,7 @@ interface State<T> {
   /**
    * get loadable obj for current state value
    */
-  loadable(): LoadableInfer<T>;
+  loadable(): Loadable<PromiseToTypeInfer<T>>;
 
   /**
    * listen state value changed
@@ -143,11 +178,20 @@ interface State<T> {
    */
   on(listener: ChangeListener): RemoveListener;
 
-  map: MapperInfer<T>;
+  map: MapInfer<T>;
 
   reset(): void;
 
   remove(): void;
+
+  extend(props?: State<T>): State<T>;
+
+  /**
+   * access synchronous value of current state
+   */
+  sync(): State<PromiseToTypeInfer<T>>;
+  all(): State<T[]>;
+  allSync(): State<PromiseToTypeInfer<T[]>>;
 }
 
 interface Loadable<T> {
@@ -156,21 +200,23 @@ interface Loadable<T> {
   value: T;
 }
 
-type MapperInfer<T> = T extends Promise<infer U>
-  ? AsyncMapper<U>
-  : SyncMapper<T>;
+type MapAllInfer<T> = T extends Promise<infer U>
+  ? (mapper: ((value: U) => U) | string) => StateRoot<Promise<U>>
+  : (mapper: ((value: T) => T) | string) => StateRoot<T>;
 
-interface AsyncMapper<T> extends PropMapper {
-  (mapper: (value: T) => T): State<Promise<T>>;
-}
+type MapInfer<T> = T extends Promise<infer U>
+  ? (mapper: ((value: U) => U) | string) => State<Promise<U>>
+  : (mapper: ((value: T) => T) | string) => State<T>;
 
-interface SyncMapper<T> extends PropMapper {
-  (mapper: (value: T) => T): State<T>;
-}
+type Watcher<T> = {
+  dispose(): void;
+  get(): T;
+  watch(onChange: Function): Unwatch;
+};
+
+type Unwatch = () => void;
 
 type PropMapper = (prop: string | number, unsafe?: boolean) => State<any>;
-
-type Mapper<Source, Destination> = (source: Source) => Destination;
 
 type AnyStateOrEffect = State<any> | Effect<any, any>;
 
@@ -180,7 +226,7 @@ type Rule =
   | [Function, ...any[]]
   | Rule[];
 
-type LoadableInfer<T> = T extends Promise<infer U> ? Loadable<U> : Loadable<T>;
+type PromiseToTypeInfer<T> = T extends Promise<infer U> ? U : T;
 
 type Reducer<T> = T extends Promise<infer U>
   ? (value: U, payload?: any) => any

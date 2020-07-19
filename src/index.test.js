@@ -1,3 +1,4 @@
+import fetch from 'node-fetch';
 import {state, effect} from 'smx';
 
 const delay = (ms = 0, value) =>
@@ -484,7 +485,7 @@ test('state middleware', () => {
   const callback = jest.fn();
   const removeMiddleware = state.use((state) => (next) => {
     callback(state.value());
-    return next(state);
+    return next(state.extend());
   });
 
   state(1);
@@ -492,4 +493,198 @@ test('state middleware', () => {
   removeMiddleware();
 
   expect(callback).toBeCalledWith(1);
+});
+
+test('effect middleware', () => {
+  const callback = jest.fn();
+  const count = state(1);
+  const removeMiddleware = effect.use((effect) => (next) => {
+    return next(
+      effect.extend({
+        run(payload) {
+          callback(payload);
+          return effect(payload);
+        },
+      }),
+    );
+  });
+
+  const increase = effect([count, (value, {by}) => value + by]);
+
+  increase({by: 100});
+
+  removeMiddleware();
+
+  expect(callback).toBeCalledWith({by: 100});
+  expect(count.value()).toBe(101);
+});
+
+test('effect api', async () => {
+  const apis = {
+    'todo-1': 'https://jsonplaceholder.typicode.com/todos/100',
+    'todo-2': 'https://jsonplaceholder.typicode.com/todos/101',
+  };
+  const removeMiddleware = effect.use((effect) => (next) => {
+    return next(
+      effect.extend({
+        run(payload) {
+          if (payload.$api) {
+            const {$api, $error, ...props} = payload;
+            return fetch(apis[$api])
+              .then((res) => res.json())
+              .then((result) =>
+                effect({
+                  ...result,
+                  ...props,
+                }),
+              );
+          }
+          return effect(payload);
+        },
+      }),
+    );
+  });
+  const callback = jest.fn();
+  const getTodo = effect(callback);
+  try {
+    await getTodo({$api: 'todo-1'});
+    await getTodo({$api: 'todo-2'});
+  } finally {
+    removeMiddleware();
+  }
+
+  expect(callback.mock.calls).toEqual([
+    [
+      {
+        userId: 5,
+        id: 100,
+        title: 'excepturi a et neque qui expedita vel voluptate',
+        completed: false,
+      },
+    ],
+    [
+      {
+        userId: 6,
+        id: 101,
+        title: 'explicabo enim cumque porro aperiam occaecati minima',
+        completed: false,
+      },
+    ],
+  ]);
+});
+
+test('sync state', async () => {
+  const asyncState = state(
+    async () => {
+      await delay(5);
+      return 10;
+    },
+    {defaultValue: 0},
+  );
+  const allAsyncState = asyncState.all();
+  const changeState = effect((payload) => [payload.state, delay(5, 11)]);
+  const syncState = asyncState.sync();
+  const allSyncState = asyncState.allSync();
+
+  expect(syncState.value()).toBe(0);
+  expect(allAsyncState.value().length).toBe(1);
+  expect(allSyncState.value()).toEqual([]);
+  await delay(10);
+  expect(syncState.value()).toBe(10);
+  expect(allSyncState.value()).toEqual([10]);
+  changeState({state: asyncState});
+  expect(syncState.value()).toBe(10);
+  expect(allSyncState.value()).toEqual([10]);
+  await delay(10);
+  expect(syncState.value()).toBe(11);
+  expect(allAsyncState.value().length).toBe(2);
+  expect(allSyncState.value()).toEqual([10, 11]);
+
+  expect(() => changeState({state: syncState})).toThrow(
+    'Cannot update readonly state',
+  );
+});
+
+test('promise chaining', async () => {
+  const countState = state(async () => 1);
+  const increase = effect([countState, (value) => value + 1]);
+
+  for (let i = 0; i < 10000; i++) {
+    await increase();
+  }
+
+  await expect(countState.value()).resolves.toBe(10001);
+});
+
+test('watchers', async () => {
+  const s1 = state(1);
+  const s2 = state(2);
+  const s3 = state(async () => 3);
+  const changeState = effect((payload) => [payload.state, payload.value]);
+  const promiseResolver = jest.fn();
+  const onChange = jest.fn();
+  const onLoadableChange = jest.fn();
+  const w1 = state.valueWatcher([s1, s2, s3], undefined, promiseResolver);
+  const w2 = state.valueWatcher([s1, s2, s3], w1, promiseResolver);
+  const w3 = state.valueWatcher([s1, s2]);
+  const w4 = state.loadableWatcher([s1, s2, s3]);
+
+  // should not create new watcher if prevInstance.targets and new targets are the same
+  expect(w2).toBe(w1);
+  expect(w2).not.toBe(w3);
+
+  const ww1 = w1.watch(onChange);
+  const ww3 = w3.watch(onChange);
+  const ww4 = w4.watch(onLoadableChange);
+
+  w1.get();
+  expect(w1.get()).toEqual([1, 2, undefined]);
+  expect(w3.get()).toEqual([1, 2]);
+  expect(w4.get().map(({state, value}) => [state, value])).toEqual([
+    ['hasValue', 1],
+    ['hasValue', 2],
+    ['loading', undefined],
+  ]);
+  expect(promiseResolver).toBeCalledTimes(2);
+
+  await delay();
+  expect(onLoadableChange).toBeCalledTimes(1);
+  expect(w4.get().map(({state, value}) => [state, value])).toEqual([
+    ['hasValue', 1],
+    ['hasValue', 2],
+    ['hasValue', 3],
+  ]);
+
+  changeState({state: s1, value: 2});
+  changeState({state: s2, value: 3});
+
+  expect(w1.get()).toEqual([2, 3, 3]);
+  expect(w3.get()).toEqual([2, 3]);
+
+  expect(promiseResolver).toBeCalledTimes(2);
+  expect(onChange).toBeCalledTimes(4);
+
+  ww1();
+  ww3();
+
+  changeState({state: s1, value: 2});
+  changeState({state: s2, value: 3});
+
+  // after unwatch, onChange should not be called any more
+  expect(onChange).toBeCalledTimes(4);
+});
+
+test('mapAll()', () => {
+  const count = state((value) => value);
+  const doubleCount = count.mapAll((value) => value * 2);
+  const increase = effect((payload) => [payload.state, (value) => value + 1]);
+
+  expect(doubleCount(5).value()).toBe(10);
+  expect(doubleCount(10).value()).toBe(20);
+
+  increase({state: count(5)});
+  increase({state: count(10)});
+
+  expect(doubleCount(5).value()).toBe(12);
+  expect(doubleCount(10).value()).toBe(22);
 });

@@ -58,4 +58,14 @@ const shape = state({
   count2,
 });
 
-console.log(shape);
+const w1 = state.valueWatcher(asyncCount);
+const w2 = state.valueWatcher([asyncCount, asyncCount]);
+const w3 = state.loadableWatcher(asyncCount);
+const w4 = state.loadableWatcher([asyncCount, asyncCount]);
+
+const ww1 = w1.watch(undefined);
+ww1();
+
+w2.watch(undefined);
+
+console.log(shape, w3, w4);
